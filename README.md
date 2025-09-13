@@ -204,4 +204,188 @@ We could:
 2. Choose a few iconic ones (e.g. GA, PSO, ACO, Immune, SA) and write **minimal PyTorch demos**.
 3. Build toward a full **“Differentiable Clever Algorithms” library** where all methods share the coevolutionary template.
 
+love this, James. DEvo gives us one template—“coevolutionary gradient games”—and we just refit each “clever algorithm” as a differentiable player in that game. Below is (1) a compact catalog mapping classics → DCL/GCAL reinterpretations, grounded in Brownlee’s indexing of the originals, (2) a minimal PyTorch DEvo engine you can reuse, and (3) tiny config snippets showing how to get GA/PSO/ACO-style behaviors from the same template.
+
+# Catalog: classic → DCL/GCAL reinterpretation
+
+* **Genetic Algorithm (GA)** → *Soft selection + gradient mutation + convex mixing*
+  Classic: population, crossover, mutation, selection  .
+  DCL: maintain Θ∈ℝ^{N×d}, update each θᵢ by gradient step on loss, then apply softmax fitness weights for selection and optional convex mixing for “crossover”:
+
+  * Variation: θᵢ ← θᵢ - η∇θᵢL + σξ
+  * Selection: wᵢ = softmax(-β Lᵢ), μ = Σᵢ wᵢ θᵢ, then θᵢ ← (1-α)θᵢ + α μ.
+  * Crossover: θᵏ ← αθᵢ + (1-α)θⱼ (random i,j).
+    (Background + taxonomy refs: ; historical notes: .)
+
+* **Particle Swarm Optimization (PSO)** → *Differentiable swarm with attractor losses*
+  Classic: velocities guided by pbest/gbest, converge around optima ; update eqs and heuristics  .
+  DCL: replace velocity with a penalty to (learned) attractors: L\_PSO(θ) = L\_task(θ) + λ‖θ - pbest‖² + γ‖θ - gbest‖²; update by gradients. Keep a differentiable memory of pbest/gbest (EMA).
+
+* **Ant Colony (Ant System / Ant Colony System)** → *Pheromone logits + soft tours*
+  Classic: pheromone + heuristic info guide step-wise probabilistic construction; local/global updates  .
+  DCL: treat pheromone as trainable logits Φ over edges; produce a soft path distribution with row-wise softmax; minimize expected tour cost; update Φ by backprop (replaces evaporate/deposit). (Procedure/usage hints: ; code-style flavor in listing refs .)
+
+* **Simulated Annealing (SA)** → *Learnable temperature + energy game*
+  Classic: Metropolis/annealing schedule, global opt via controlled cooling  .
+  DCL: treat temperature τ as a differentiable policy parameter; optimize E(θ) + τ·H(q) with τ adapted by a controller in competition with a “disturber” that injects noise.
+
+* **Harmony Search (HS)** → *Differentiable memory bank prior*
+  Classic: improvisation from memory with consideration/adjustment rates ; listing & heuristics context .
+  DCL: keep a learnable bank M of K harmonies; sample new θ with mixture-of-Gaussians centered on M; update M by soft selection gradients; “pitch adjustment” = small gradient steps.
+
+* **Clonal Selection (Immune)** → *Hypermutation as loss-shaped step size*
+  Classic: clone proportional to affinity, hypermutate inversely to fitness, reseed diversity  .
+  DCL: set per-individual step size ηᵢ = g(Lᵢ) (e.g., larger when poor), then gradient step + soft selection; occasional random reseeding retains exploration.
+
+* **Differential Evolution (DE)** → *Difference-vector mixing as differentiable recombination*
+  Classic: DE/x/y/z, generate trial from weighted differences and select if better   .
+  DCL: replace hard “trial-if-better” with soft acceptance; implement the difference mix inside a computational graph, then apply soft selection.
+
+> Index cross-check (where Brownlee collects these): Evolutionary (GA/ES/DE), Physical (SA/HS), Swarm (PSO/ACO), Immune (Clonal/DCA) ; PSO detail: ; ACO detail: ; SA detail: ; HS listing slice: ; Clonal detail: ; DE detail: .
+
+---
+
+# Minimal DEvo engine (PyTorch)
+
+```python
+# devo.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.set_default_dtype(torch.float32)
+
+class Population(nn.Module):
+    def __init__(self, n: int, d: int, init_scale=0.1):
+        super().__init__()
+        self.theta = nn.Parameter(init_scale * torch.randn(n, d))
+        self.pbest = None  # optional memory (for PSO-like configs)
+
+    def soft_select_center(self, losses, beta=5.0):
+        w = F.softmax(-beta * losses.detach(), dim=0)  # no grad through weights
+        return (w.unsqueeze(1) * self.theta).sum(dim=0, keepdim=True)  # [1,d]
+
+    @torch.no_grad()
+    def crossover_mix(self, rate=0.2):
+        n, d = self.theta.shape
+        idx_i = torch.randint(0, n, (n,))
+        idx_j = torch.randint(0, n, (n,))
+        alpha = torch.rand(n, 1)
+        mixed = alpha * self.theta[idx_i] + (1 - alpha) * self.theta[idx_j]
+        mask = (torch.rand(n, 1) < rate).float()
+        self.theta.add_(mask * (mixed - self.theta))
+
+    def step(self, loss_fn, eta=0.1, beta=5.0, noise=0.01, select=0.2):
+        # 1) Compute losses with grad
+        losses = loss_fn(self.theta)  # shape [n]
+        losses.mean().backward()
+        with torch.no_grad():
+            # 2) Gradient mutation (descent) + exploration
+            self.theta -= eta * self.theta.grad
+            self.theta += noise * torch.randn_like(self.theta)
+            self.theta.grad.zero_()
+            # 3) Soft selection toward weighted mean
+            center = self.soft_select_center(losses, beta=beta)  # [1,d]
+            self.theta = nn.Parameter((1 - select) * self.theta + select * center)
+            # 4) Optional crossover-style convex mixing
+            self.crossover_mix(rate=0.2)
+
+class CoevoGame:
+    def __init__(self, comp: Population, dist: Population, device="cpu"):
+        self.C, self.D = comp.to(device), dist.to(device)
+        self.device = device
+
+    def step(self, Lc, Ld, **kw):
+        # losses are callables over populations; co-adapt in alternating fashion
+        self.C.step(lambda x: Lc(x, self.D.theta.detach()), **kw)
+        self.D.step(lambda x: Ld(x, self.C.theta.detach()), **kw)
+
+# ---------- demo helpers ----------
+def sphere(x): return (x**2).sum(dim=1)  # simple convex loss
+def rastrigin(x):  # nonconvex
+    A = 10.0
+    return A * x.shape[1] + (x**2 - A * torch.cos(2 * torch.pi * x)).sum(dim=1)
+```
+
+### Configure 3 demos quickly
+
+```python
+# 1) GA → DEvo (single-pop minimization on Rastrigin)
+N, D = 64, 10
+pop = Population(N, D)
+for t in range(300):
+    pop.step(loss_fn=rastrigin, eta=0.02, beta=10.0, noise=0.05, select=0.3)
+best_ga_devo = rastrigin(pop.theta).min().item()
+
+# 2) PSO → Differentiable Swarm (attractors as penalties)
+def pso_like_loss(theta, pbest, gbest, lam=0.1, gam=0.2):
+    base = rastrigin(theta)
+    return base + lam*((theta - pbest)**2).sum(dim=1) + gam*((theta - gbest)**2).sum(dim=1)
+
+N, D = 64, 10
+swarm = Population(N, D)
+pbest = swarm.theta.detach().clone()
+gbest = pbest[rastrigin(pbest).argmin()].detach().clone()
+
+for t in range(300):
+    # update losses with current memories
+    losses = pso_like_loss(swarm.theta, pbest, gbest)
+    losses.mean().backward(); swarm.step(lambda x: pso_like_loss(x, pbest, gbest), 
+                                         eta=0.03, beta=8.0, noise=0.02, select=0.25)
+    with torch.no_grad():
+        # refresh memories (differentiable training; memory updates are non-grad)
+        new_pb_mask = rastrigin(swarm.theta) < rastrigin(pbest)
+        pbest = torch.where(new_pb_mask.unsqueeze(1), swarm.theta.detach(), pbest)
+        gbest = pbest[rastrigin(pbest).argmin()].detach().clone()
+
+best_pso_devo = rastrigin(swarm.theta).min().item()
+
+# 3) ACO → Differentiable pheromones on a tiny TSP (soft path expectation)
+# Graph with 5 nodes: coordinates -> distance matrix
+coords = torch.tensor([[0,0],[1,0],[1,1],[0,1],[0.5,0.3]], dtype=torch.float32)
+Dmat = torch.cdist(coords, coords, p=2) + torch.eye(5)*1e6  # avoid self-loops
+phi = nn.Parameter(torch.zeros(5,5))  # pheromone logits
+opt = torch.optim.Adam([phi], lr=0.1)
+
+def soft_tour_cost(phi, L=5):
+    P = F.softmax(phi, dim=1)  # transition matrix
+    # expected one-step cost under P
+    exp_cost = (P * Dmat).sum()
+    # encourage cycles of length L by powering the chain; regularize to avoid trivial traps
+    reg = (P**2).sum()
+    return exp_cost + 0.01*reg
+
+for t in range(500):
+    opt.zero_grad()
+    loss = soft_tour_cost(phi)
+    loss.backward(); opt.step()
+
+# Extract greedy tour logits just to inspect
+P = F.softmax(phi, dim=1).detach()
+```
+
+* The **GA→DEvo** loop shows gradient mutation + soft selection + occasional convex mixing (our “crossover”).
+* The **PSO→DEvo** loop mimics pbest/gbest with differentiable penalties instead of explicit velocities (PSO background: , update structure: ).
+* The **ACO→Differentiable** demo treats pheromones as logits; we optimize expected path cost directly by backprop (Ant System/ACS context:  ).
+
+> You can slot **SA**, **HS**, **Clonal**, **DE** by just swapping the loss or the memory term:
+>
+> * SA: learn τ and add entropy/temperature-weighted smoothing to L; anneal τ via gradient (SA overview: ).
+> * HS: represent a memory bank M and add a loss that pulls candidates toward a soft mixture over M with small Gaussian “pitch” steps (HS context: ).
+> * Clonal: set step size ηᵢ = g(Lᵢ) to realize hypermutation (CLONALG flow: ).
+> * DE: implement the “difference-vector” mixer inside the graph, then use soft acceptance instead of if-better replacement (DE taxonomy/procedure:  ).
+
+---
+
+# What I’d do next
+
+1. **Fill the catalog** (one page each): short DCL spec for GA, PSO, ACO, SA, HS, Clonal, DE with the exact loss(s), memory, and exploration terms.
+2. **Ship the three demos above as `examples/`**, then add SA and Clonal variants (reuse the same Population class).
+3. **Wrap into a tiny library**: `CoEvolutionGame`, `Population`, and a few plug-in “behaviors” (PSO-attractor, Clonal-hypermutation, DE-diffmix).
+
+If you want, I can turn the snippets into a clean `pip`-style package layout next.
+
+---
+
+**Sources (Brownlee, *Clever Algorithms*)**: overview & TOC for each family ; GA  ; PSO  ; Ant System/ACS  ; SA ; HS ; Clonal Selection ; DE  .&#x20;
 
